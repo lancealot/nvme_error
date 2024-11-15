@@ -40,6 +40,7 @@ Monitor NVME device errors using PCIe Advanced Error Reporting (AER).
 
 Options:
     -d    Display current status and exit (single run mode)
+    -j    Output data in JSON format and exit
     -h    Display this help message and exit
 
 When run without options, the script continuously monitors errors,
@@ -53,10 +54,17 @@ if [[ "$1" == "-h" ]]; then
     show_help
 fi
 
-# Check for -d flag
+# Check for flags
 SINGLE_RUN=false
+JSON_OUTPUT=false
 if [[ "$1" == "-d" ]]; then
     SINGLE_RUN=true
+elif [[ "$1" == "-j" ]]; then
+    JSON_OUTPUT=true
+elif [[ "$1" != "" ]]; then
+    echo "Invalid option: $1" >&2
+    echo "Use -h for help" >&2
+    exit 1
 else
     clear
 fi
@@ -92,7 +100,56 @@ build_serial_mapping() {
     done < <(nvme list | grep -v "Node")
 }
 
-# Function to display header and data
+# Function to display JSON output
+display_json() {
+    # Start JSON array
+    echo "{"
+    echo "  \"timestamp\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\","
+    echo "  \"devices\": ["
+    
+    local first=true
+    for DEVICE in $(lspci | grep "Non-Volatile memory controller" | awk '{print $1}'); do
+        # Read current error count
+        CURRENT_ERR=$(setpci -s $DEVICE ECAP_AER+10.l)
+        
+        # Update cumulative errors
+        if [[ -z ${CUMM_ERR[$DEVICE]} ]]; then
+            CUMM_ERR[$DEVICE]=0
+        fi
+        CUMM_ERR[$DEVICE]=$((CUMM_ERR[$DEVICE] + 0x$CURRENT_ERR))
+        
+        # Reset current error counter
+        setpci -s $DEVICE ECAP_AER+10.l=31c1
+        
+        # Get the NVME device name and serial number
+        NVME_DEV="${DEVICE_MAP[$DEVICE]:-N/A}"
+        SERIAL="${SERIAL_MAP[$NVME_DEV]:-N/A}"
+        
+        # Add comma if not first entry
+        if [ "$first" = true ]; then
+            first=false
+        else
+            echo ","
+        fi
+        
+        # Print device info as JSON object
+        cat << EOF
+    {
+      "device": "$NVME_DEV",
+      "pci_address": "$DEVICE",
+      "serial": "$SERIAL",
+      "current_error": "$CURRENT_ERR",
+      "cumulative_errors": ${CUMM_ERR[$DEVICE]}
+    }
+EOF
+    done
+    
+    # Close JSON array and object
+    echo -e "\n  ]"
+    echo "}"
+}
+
+# Function to display regular output
 display_output() {
     # Print title
     echo "Current NVME device errors:"
@@ -133,7 +190,10 @@ display_output() {
 build_device_mapping
 build_serial_mapping
 
-if [ "$SINGLE_RUN" = true ]; then
+if [ "$JSON_OUTPUT" = true ]; then
+    # JSON output mode
+    display_json
+elif [ "$SINGLE_RUN" = true ]; then
     # Single run mode
     display_output
 else
