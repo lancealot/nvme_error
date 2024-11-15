@@ -1,6 +1,4 @@
-# =============================================================================
 # NVME Error Monitor
-# =============================================================================
 #
 # Description:
 #   This script monitors PCIe Advanced Error Reporting (AER) for NVME devices.
@@ -27,4 +25,3 @@
 #   - setpci command
 #   - udevadm command
 #   - Standard Linux utilities (awk, sed, grep)
-# =============================================================================
