@@ -25,3 +25,21 @@ Description:
    - setpci command
    - udevadm command
    - Standard Linux utilities (awk, sed, grep)
+
+An example output from the interface:
+```
+Current NVME device errors:
+
+Device          BUS:DEV.FNC     Serial               Current Error        Cumm Err       
+-------------------------------------------------------------------------------------
+nvme9           01:00.0         3224104941F2         00000000             1              
+nvme2           02:00.0         32241049423D         00000081             4354           
+nvme3           03:00.0         3224104941F1         00000000             0              
+nvme4           04:00.0         312410457617         00000000             0              
+nvme6           05:00.0         MSA250901BW          00000000             0              
+nvme5           06:00.0         MSA250901BX          00000000             0              
+nvme0           c1:00.0         32241049428A         00000001             130            
+nvme1           c2:00.0         322410494289         00000081             322            
+nvme8           c3:00.0         32241049428B         00000000             0              
+nvme7           c4:00.0         312410457603         00000000             0
+```
