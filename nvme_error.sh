@@ -76,7 +76,7 @@ declare -A SERIAL_MAP
 
 # Function to build device mapping
 build_device_mapping() {
-    local nvme_devices=($(ls /dev/nvme[0-9] 2>/dev/null))
+    local nvme_devices=($(ls /dev/nvme[0-9]* 2>/dev/null | grep -E '/dev/nvme[0-9]+$' | sort -V))
     for nvme_dev in "${nvme_devices[@]}"; do
         # Extract PCI address from udevadm
         local pci_path=$(udevadm info --query=path --name="$nvme_dev")
