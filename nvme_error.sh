@@ -34,20 +34,29 @@
 #   - SERIAL:      drive serial number (from sysfs)
 #   - MODEL:       drive model (from sysfs)
 #   - LINK:        current PCIe link (yellow ! if below the drive's max)
+#   - TEMP:        composite temperature in Celsius, colored against the
+#                  drive's own warning/critical thresholds when reported
 #   - NEW:         error events in the last poll interval
 #   - CORR/UNC:    correctable / uncorrectable events since start
 #   - LAST ERROR:  time and decoded type(s) of the most recent error
+#
+# Temperature source:
+#   Read from the kernel's NVMe hwmon interface (kernel >= 5.5 with
+#   CONFIG_NVME_HWMON) with no external tools; falls back to
+#   'nvme smart-log' (nvme-cli) when hwmon is unavailable.
 #
 # Dependencies:
 #   - bash >= 4.2
 #   - setpci (pciutils)
 #   - Linux sysfs (/sys/bus/pci, /sys/class/nvme)
+#   - nvme-cli (optional, only as temperature fallback on old kernels)
 # =============================================================================
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
-# sysfs root (overridable for testing)
+# sysfs and /dev roots (overridable for testing)
 SYS="${NVME_ERROR_SYS:-/sys}"
+DEV="${NVME_ERROR_DEV:-/dev}"
 
 # =============================================================================
 # AER status bit definitions (PCIe spec, AER extended capability)
@@ -247,8 +256,12 @@ trap 'exit 143' TERM
 # =============================================================================
 
 declare -A NVME_OF SERIAL_OF MODEL_OF FW_OF
+declare -A TEMP_FILE_OF TEMP_WARN_OF TEMP_CRIT_OF
 PCI_DEVS=()
 DISPLAY_ORDER=()
+
+HAVE_NVME_CLI=false
+command -v nvme > /dev/null 2>&1 && HAVE_NVME_CLI=true
 
 sysval() {
     local v=""
@@ -265,8 +278,11 @@ sysline() {
 
 discover_devices() {
     local class_file class addr ctrl link name
+    local hw hname hdir devlink taddr tail v
+    local -A addr_of_name=()
     PCI_DEVS=()
     NVME_OF=() SERIAL_OF=() MODEL_OF=() FW_OF=()
+    TEMP_FILE_OF=() TEMP_WARN_OF=() TEMP_CRIT_OF=()
 
     # every PCI function with class 0x0108xx (non-volatile memory controller)
     for class_file in "$SYS"/bus/pci/devices/*/class; do
@@ -285,9 +301,34 @@ discover_devices() {
         [[ -e $SYS/bus/pci/devices/$addr ]] || continue
         name=${ctrl##*/}
         NVME_OF[$addr]=$name
+        addr_of_name[$name]=$addr
         SERIAL_OF[$addr]=$(sysval "$ctrl/serial")
         MODEL_OF[$addr]=$(sysline "$ctrl/model")
         FW_OF[$addr]=$(sysval "$ctrl/firmware_rev")
+    done
+
+    # locate the kernel's NVMe hwmon sensors (kernel >= 5.5).  Depending on
+    # kernel version the hwmon device's parent is either the PCI device or
+    # the nvme class device, so accept both.
+    for hw in "$SYS"/class/hwmon/*/name; do
+        [[ -r $hw ]] || continue
+        read -r hname < "$hw"
+        [[ $hname == nvme ]] || continue
+        hdir=${hw%/name}
+        devlink=$(readlink -f "$hdir/device" 2> /dev/null) || continue
+        taddr=""
+        if [[ $devlink =~ /nvme/(nvme[0-9]+)$ ]]; then
+            taddr=${addr_of_name[${BASH_REMATCH[1]}]:-}
+        else
+            tail=${devlink##*/}
+            [[ -n ${NVME_OF[$tail]:-} ]] && taddr=$tail
+        fi
+        [[ -n $taddr && -r $hdir/temp1_input ]] || continue
+        TEMP_FILE_OF[$taddr]="$hdir/temp1_input"
+        v=$(sysval "$hdir/temp1_max")
+        [[ $v =~ ^[0-9]+$ ]] && TEMP_WARN_OF[$taddr]=$(( (v + 500) / 1000 ))
+        v=$(sysval "$hdir/temp1_crit")
+        [[ $v =~ ^[0-9]+$ ]] && TEMP_CRIT_OF[$taddr]=$(( (v + 500) / 1000 ))
     done
 
     # display order: by nvme number, then unbound controllers by PCI address
@@ -325,6 +366,27 @@ gen_of_speed() {
         64 | 64.0) printf 'Gen6' ;;
         *)         printf '%s' "${1%% *}GT" ;;
     esac
+}
+
+# get_temp <pci-addr> -> sets TEMP_C ("" if unknown), TEMP_WARN, TEMP_CRIT.
+# Prefers the kernel hwmon sensor; falls back to 'nvme smart-log' (reports
+# Kelvin in JSON output) when hwmon is unavailable.
+get_temp() {
+    local addr=$1 f=${TEMP_FILE_OF[$addr]:-} t name
+    TEMP_C=""
+    TEMP_WARN=${TEMP_WARN_OF[$addr]:-70}
+    TEMP_CRIT=${TEMP_CRIT_OF[$addr]:-80}
+    if [[ -n $f ]]; then
+        t=$(sysval "$f")
+        [[ $t =~ ^-?[0-9]+$ ]] && TEMP_C=$(( (t + 500) / 1000 ))
+        return
+    fi
+    name=${NVME_OF[$addr]:-}
+    [[ -n $name && $HAVE_NVME_CLI == true && -e $DEV/$name ]] || return 0
+    t=$(nvme smart-log "$DEV/$name" -o json 2> /dev/null)
+    [[ $t =~ \"temperature\"[[:space:]]*:[[:space:]]*([0-9]+) ]] \
+        && TEMP_C=$(( BASH_REMATCH[1] - 273 ))
+    return 0
 }
 
 read_link() {
@@ -455,7 +517,7 @@ reset_counters() {
 # =============================================================================
 
 # Column widths (PCI width adapts: short form unless a non-zero domain exists)
-W_DEV=8 W_SER=16 W_MOD=21 W_LNK=10 W_NEW=4 W_CORR=7 W_UNC=6 W_LAST=30
+W_DEV=8 W_SER=16 W_MOD=21 W_LNK=10 W_TMP=4 W_NEW=4 W_CORR=7 W_UNC=6 W_LAST=30
 PCI_W=8
 FLASH_MSG=""
 
@@ -470,7 +532,7 @@ set_pci_width() {
     for addr in "${PCI_DEVS[@]}"; do
         [[ $addr == 0000:* ]] || { PCI_W=12; break; }
     done
-    TABLE_W=$(( 2 + W_DEV + PCI_W + W_SER + W_MOD + W_LNK + W_NEW + W_CORR + W_UNC + W_LAST + 9 ))
+    TABLE_W=$(( 2 + W_DEV + PCI_W + W_SER + W_MOD + W_LNK + W_TMP + W_NEW + W_CORR + W_UNC + W_LAST + 10 ))
 }
 
 fmt_duration() {
@@ -485,16 +547,16 @@ rule() {
 }
 
 # total table width; recomputed by set_pci_width when the PCI column widens
-TABLE_W=$(( 2 + W_DEV + PCI_W + W_SER + W_MOD + W_LNK + W_NEW + W_CORR + W_UNC + W_LAST + 9 ))
+TABLE_W=$(( 2 + W_DEV + PCI_W + W_SER + W_MOD + W_LNK + W_TMP + W_NEW + W_CORR + W_UNC + W_LAST + 10 ))
 
 # compose_table -> appends the header + one row per device to BUF
 compose_table() {
     local addr name serial model dot row nc nu new_n
-    local c_dev c_pci c_ser c_mod c_lnk c_new c_corr c_unc c_last
+    local c_dev c_pci c_ser c_mod c_lnk c_tmp c_new c_corr c_unc c_last
 
-    printf -v row '%-*s %-*s %-*s %-*s %-*s %*s %*s %*s %s' \
+    printf -v row '%-*s %-*s %-*s %-*s %-*s %*s %*s %*s %*s %s' \
         "$W_DEV" "DEVICE" "$PCI_W" "PCI ADDR" "$W_SER" "SERIAL" \
-        "$W_MOD" "MODEL" "$W_LNK" "LINK" "$W_NEW" "NEW" \
+        "$W_MOD" "MODEL" "$W_LNK" "LINK" "$W_TMP" "TEMP" "$W_NEW" "NEW" \
         "$W_CORR" "CORR" "$W_UNC" "UNC" "LAST ERROR"
     BUF+="  ${C_BOLD}${row}${C_RESET}${EOL}"$'\n'
     BUF+="${C_DIM}$(rule "$TABLE_W")${C_RESET}${EOL}"$'\n'
@@ -533,6 +595,20 @@ compose_table() {
             "${LINK_TEXT}$([[ $LINK_DEGRADED == true ]] && printf '!')"
         [[ $LINK_DEGRADED == true ]] && c_lnk="${C_YELLOW}${c_lnk}${C_RESET}"
 
+        # composite temperature, colored against the drive's own thresholds
+        get_temp "$addr"
+        if [[ -n $TEMP_C ]]; then
+            printf -v c_tmp '%*s' "$W_TMP" "$TEMP_C"
+            if (( TEMP_C >= TEMP_CRIT )); then
+                c_tmp="${C_BOLD}${C_RED}${c_tmp}${C_RESET}"
+            elif (( TEMP_C >= TEMP_WARN )); then
+                c_tmp="${C_YELLOW}${c_tmp}${C_RESET}"
+            fi
+        else
+            printf -v c_tmp '%*s' "$W_TMP" "-"
+            c_tmp="${C_DIM}${c_tmp}${C_RESET}"
+        fi
+
         if [[ ${AER_OK[$addr]:-true} == false ]]; then
             printf -v c_new '%*s' "$W_NEW" "-"
             printf -v c_corr '%*s' "$W_CORR" "n/a"
@@ -563,7 +639,7 @@ compose_table() {
             fi
         fi
 
-        BUF+="${dot} ${c_dev} ${c_pci} ${c_ser} ${c_mod} ${c_lnk} ${c_new} ${c_corr} ${c_unc} ${c_last}${EOL}"$'\n'
+        BUF+="${dot} ${c_dev} ${c_pci} ${c_ser} ${c_mod} ${c_lnk} ${c_tmp} ${c_new} ${c_corr} ${c_unc} ${c_last}${EOL}"$'\n'
     done
 }
 
@@ -697,6 +773,8 @@ display_json() {
         printf '      "firmware": "%s",\n' "$(json_escape "${FW_OF[$addr]:-N/A}")"
         printf '      "link": {"speed": "%s", "width": "%s", "max_speed": "%s", "max_width": "%s", "degraded": %s},\n' \
             "$LINK_SPEED" "$LINK_WIDTH" "$LINK_MAX_SPEED" "$LINK_MAX_WIDTH" "$LINK_DEGRADED"
+        get_temp "$addr"
+        printf '      "temperature_c": %s,\n' "${TEMP_C:-null}"
         printf '      "aer_supported": %s,\n' "${AER_OK[$addr]:-false}"
         printf '      "correctable": {"status_raw": "%s", "events": %s, "types": %s},\n' \
             "${corr:-}" "$corr_count" "$corr_names"

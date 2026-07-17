@@ -22,6 +22,10 @@ record of what was observed.
 - Per-device health dot, serial, model, and current PCIe link speed/width,
   with a warning when a link trains below the drive's maximum (a common
   companion to correctable error storms)
+- Composite drive temperature, colored against the drive's own
+  warning/critical thresholds — read from the kernel's NVMe hwmon sensor
+  (kernel >= 5.5) with no extra tools, falling back to `nvme smart-log`
+  on older kernels
 - Rolling "recent events" pane with timestamps, plus optional append-only
   event log file (`-l FILE`)
 - Session summary on exit (totals per device, last error, recent events)
@@ -57,17 +61,17 @@ Interactive keys (live mode):
 NVMe AER Monitor · host1 · updated 2026-07-17 15:27:00 · every 2s · up 00:12:34
   devices: 7  with errors: 2  events: 2 corr / 1 uncorr
 
-  DEVICE   PCI ADDR SERIAL           MODEL                 LINK        NEW    CORR    UNC LAST ERROR
-─────────────────────────────────────────────────────────────────────────────────────────────────────
-● nvme0    c1:00.0  292410438E89     SAMSUNG MZQL21T9HCJR- Gen4 x4       -       0      0 -
-● nvme2    c3:00.0  3224104DC1CD     INTEL SSDPF2KX038TZ   Gen4 x4       -     n/a      - no AER capability
-● nvme4    01:00.0  292410438E84     SAMSUNG MZQL21T9HCJR- Gen4 x4      +2       2      0 15:27:00 RxErr AdvNF
-● nvme5    02:00.0  3224104DC0ED     SAMSUNG MZQL21T9HCJR- Gen3 x4!      -       0      0 -
-● nvme6    03:00.0  3224104DC085     SAMSUNG MZQL21T9HCJR- Gen4 x4       -       0      0 -
-● nvme8    05:00.0  MSA250901B2      Micron_7450_MTFDKBG3T Gen4 x4      +1       0      1 15:27:00 CmpltTO
-● -        c2:00.0  -                (no nvme driver)      Gen1 x1!      -       0      0 -
+  DEVICE   PCI ADDR SERIAL           MODEL                 LINK       TEMP  NEW    CORR    UNC LAST ERROR
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+● nvme0    c1:00.0  292410438E89     SAMSUNG MZQL21T9HCJR- Gen4 x4      72    -       0      0 -
+● nvme2    c3:00.0  3224104DC1CD     INTEL SSDPF2KX038TZ   Gen4 x4      38    -     n/a      - no AER capability
+● nvme4    01:00.0  292410438E84     SAMSUNG MZQL21T9HCJR- Gen4 x4      38   +2       2      0 15:27:00 RxErr AdvNF
+● nvme5    02:00.0  3224104DC0ED     SAMSUNG MZQL21T9HCJR- Gen3 x4!     38    -       0      0 -
+● nvme6    03:00.0  3224104DC085     SAMSUNG MZQL21T9HCJR- Gen4 x4       -    -       0      0 -
+● nvme8    05:00.0  MSA250901B2      Micron_7450_MTFDKBG3T Gen4 x4      83   +1       0      1 15:27:00 CmpltTO
+● -        c2:00.0  -                (no nvme driver)      Gen1 x1!      -    -       0      0 -
 
-── recent events ────────────────────────────────────────────────────────────────────────────────────
+── recent events ─────────────────────────────────────────────────────────────────────────────────────────
   15:27:00  nvme8  uncorrectable: CmpltTO (status 0x00004000)
   15:27:00  nvme4  correctable: RxErr AdvNF (status 0x00002001)
 
@@ -84,6 +88,7 @@ Column meanings:
 | SERIAL     | Drive serial number (from sysfs)                                        |
 | MODEL      | Drive model string (from sysfs)                                         |
 | LINK       | Current PCIe link; `!` (yellow) if below the drive's max speed or width |
+| TEMP       | Composite temperature in °C; yellow at the drive's warning threshold, red at critical (defaults 70/80 °C when the drive reports none); `-` if unavailable |
 | NEW        | Error events observed in the last poll interval                         |
 | CORR / UNC | Correctable / uncorrectable events since the monitor started            |
 | LAST ERROR | Time and decoded type(s) of the most recent error                       |
@@ -95,7 +100,7 @@ non-destructive read that leaves the registers latched):
 
 ```json
 {
-  "version": "2.0.0",
+  "version": "2.1.0",
   "timestamp": "2026-07-17T15:27:00Z",
   "host": "host1",
   "reset_after_read": true,
@@ -107,6 +112,7 @@ non-destructive read that leaves the registers latched):
       "model": "SAMSUNG MZQL21T9HCJR-00A07",
       "firmware": "GDC5902Q",
       "link": {"speed": "16.0 GT/s", "width": "4", "max_speed": "16.0 GT/s", "max_width": "4", "degraded": false},
+      "temperature_c": 38,
       "aer_supported": true,
       "correctable": {"status_raw": "00002001", "events": 2, "types": ["RxErr", "AdvNF"]},
       "uncorrectable": {"status_raw": "00000000", "events": 0, "types": []},
@@ -150,11 +156,19 @@ With `-l FILE`, each error event is appended as one line:
   where AER interrupts are handled by firmware and never reach the kernel
   log — but note that clearing the status bits is visible to any other
   AER consumer on the system.
+- Temperature comes from the kernel's NVMe hwmon sensor
+  (`/sys/class/hwmon/hwmonN` with name `nvme`, available since kernel 5.5
+  with `CONFIG_NVME_HWMON`), including the drive's own warning/critical
+  thresholds (`temp1_max`/`temp1_crit`, i.e. WCTEMP/CCTEMP). If no hwmon
+  sensor exists, the script falls back to `nvme smart-log -o json` when
+  nvme-cli happens to be installed; otherwise the column shows `-`.
 
 ## Dependencies
 
 - bash >= 4.2
 - `setpci` (pciutils package)
 - Linux sysfs (`/sys/bus/pci`, `/sys/class/nvme`)
+- nvme-cli — **optional**, used only as a temperature fallback on kernels
+  older than 5.5 (no hwmon sensor); everything else works without it
 
 Root is required: `setpci` needs raw access to PCI config space.
